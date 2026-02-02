@@ -27,13 +27,25 @@
 #include "access/nbtree.h"
 #include "access/skey.h"
 #include "executor/nodeIndexscan.h"
+#if PG_VERSION_NUM >= 180000
+#include "commands/explain_format.h"
+#endif
 #include "parser/parse_coerce.h"
 #include "pgstat.h"
 
+#if PG_VERSION_NUM >= 180000
 void
-init_index_scan_state(OPlanState *o_plan_state, OScanState *ostate, Relation index,
-					  ExprContext *econtext, IndexRuntimeKeyInfo **runtimeKeys,
-					  int *numRuntimeKeys, ScanKeyData **scanKeys, int *numScanKeys)
+init_index_scan_state(OPlanState *o_plan_state, OScanState *ostate,
+					  Relation index, ExprContext *econtext, Snapshot snapshot,
+					  IndexRuntimeKeyInfo **runtimeKeys, int *numRuntimeKeys,
+					  ScanKeyData **scanKeys, int *numScanKeys)
+#else
+void
+init_index_scan_state(OPlanState *o_plan_state, OScanState *ostate,
+					  Relation index, ExprContext *econtext,
+					  IndexRuntimeKeyInfo **runtimeKeys, int *numRuntimeKeys,
+					  ScanKeyData **scanKeys, int *numScanKeys)
+#endif
 {
 	IndexScanDesc scan;
 
@@ -48,6 +60,9 @@ init_index_scan_state(OPlanState *o_plan_state, OScanState *ostate, Relation ind
 
 	scan->parallel_scan = NULL;
 	scan->xs_temp_snap = false;
+#if PG_VERSION_NUM >= 180000
+	scan->xs_snapshot = snapshot;
+#endif
 }
 
 static bool
