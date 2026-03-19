@@ -297,11 +297,12 @@ wal_container_read_header(WalReaderState *r, bool allow_logging)
  * misread.
  */
 static inline WalParseResult
-wal_container_parse_flag(WalReaderState *r, wal_type_t type)
+wal_container_parse_flag(WalReaderState *r, WalRecord *rec, wal_type_t type)
 {
 	WalParseResult st = WALPARSE_OK;
 
 	Assert(r);
+	Assert(rec);
 
 	if (r->wal_flags & type)
 	{
@@ -314,14 +315,10 @@ wal_container_parse_flag(WalReaderState *r, wal_type_t type)
 		Assert(d && d->parse);
 		if (d && d->parse)
 		{
-			WalRecord	rec;
-
-			memset(&rec, 0, sizeof(rec));
-
-			rec.type = type;
-			st = d->parse(r, &rec);
+			rec->type = type;
+			st = d->parse(r, rec);
 			if (st == WALPARSE_OK && r->on_flag)
-				st = r->on_flag(r->ctx, &rec);
+				st = r->on_flag(r->ctx, rec);
 		}
 		else
 			st = WALPARSE_BAD_TYPE;
@@ -353,15 +350,16 @@ wal_container_parse_flag(WalReaderState *r, wal_type_t type)
  * On success, r->ptr is positioned at the first record tag byte.
  */
 static inline WalParseResult
-wal_container_parse_flags(WalReaderState *r)
+wal_container_parse_flags(WalReaderState *r, WalRecord *rec)
 {
 	WalParseResult st = WALPARSE_OK;
 
 	Assert(r);
+	Assert(rec);
 
 #define X(sym, val, name, fn) \
 do { \
-	st = wal_container_parse_flag(r, sym); \
+	st = wal_container_parse_flag(r, rec, sym); \
 	if (st != WALPARSE_OK) \
 		return st; \
 } while(0);
@@ -459,7 +457,7 @@ parse_wal_container(WalReaderState *r, bool allow_logging)
 	 * The flag handling also gives the consumer a chance to capture
 	 * header-wide context (e.g. xact-info) before any records are delivered.
 	 */
-	st = wal_container_parse_flags(r);
+	st = wal_container_parse_flags(r, &rec);
 	if (st != WALPARSE_OK)
 		return st;
 

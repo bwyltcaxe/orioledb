@@ -74,6 +74,7 @@ static pairingheap retainUndoLocHeaps[(int) UndoLogsCount] =
 
 /* A minimal subtransaciton id, where OrioleDB got involved */
 static SubTransactionId minParentSubId = InvalidSubTransactionId;
+static XLogRecPtr independent_commit_lsn = InvalidXLogRecPtr;
 
 typedef void (*UndoCallback) (UndoLogType undoType, UndoLocation location,
 							  UndoStackItem *item, OXid oxid, bool abort,
@@ -196,6 +197,74 @@ static OBuffersDesc undoBuffersDesc =
 
 static void wait_for_reserved_location(UndoLogType undoType,
 									   UndoLocation undoLocationToWait);
+
+/*
+ * Helper for orioledb_get_independent_commit_lsn.
+ * PG xid-less commit hook is only for top-level Oriole transactions that
+ * participate in logical apply/origin tracking. Autonomous transactions use
+ * their own commit path and must stay invisible to this hook.
+ */
+static inline bool
+is_independent_oriole_transaction(OXid oxid, TransactionId logicalXid)
+{
+	return OXidIsValid(oxid) &&
+		GET_CUR_PROCDATA()->autonomousNestingLevel == 0 &&
+		!TransactionIdIsValid(GetTopTransactionIdIfAny()) &&
+		TransactionIdIsValid(logicalXid);
+}
+
+/*
+ * Materialize a durable WAL anchor for an independent Oriole commit.
+ */
+static XLogRecPtr
+finalize_independent_commit_wal(OXid oxid, TransactionId logicalXid)
+{
+	XLogRecPtr flushPos = InvalidXLogRecPtr;
+
+	Assert(OXidIsValid(oxid));
+
+	if (OXidIsValid(oxid))
+	{
+		current_oxid_xlog_precommit();
+		flushPos = wal_commit(oxid, logicalXid, false);
+		set_oxid_xlog_ptr(oxid, flushPos);
+	}
+
+	return flushPos;
+}
+
+/*
+ * Supply PG with the durable local commit LSN for the current xid-less,
+ * top-level Oriole transaction. Autonomous transactions are filtered out by
+ * is_independent_oriole_transaction() and continue to use their own commit
+ * path.
+ */
+bool
+orioledb_get_independent_commit_lsn(XLogRecPtr *local_commit)
+{
+	OXid			oxid = get_current_oxid_if_any();
+	LogicalXidCtx	logicalXidContext;
+
+	Assert(local_commit != NULL);
+
+	*local_commit = InvalidXLogRecPtr;
+	get_current_logical_xid_ctx(&logicalXidContext);
+
+	if (!is_independent_oriole_transaction(oxid, logicalXidContext.xid))
+		return false;
+
+	if (XLogRecPtrIsInvalid(independent_commit_lsn))
+	{
+		if (TransactionIdIsValid(logicalXidContext.xid))
+		{
+			independent_commit_lsn = finalize_independent_commit_wal(oxid, logicalXidContext.xid);
+		}
+	}
+
+	*local_commit = independent_commit_lsn;
+
+	return XLogRecPtrIsValid(*local_commit);
+}
 
 /*
  * A sorted array comprising a map from CommandId to the UndoLocation of the
@@ -2028,6 +2097,7 @@ undo_xact_callback(XactEvent event, void *arg)
 			orioledb_reset_xmin_hook();
 			reset_command_undo_locations();
 			oxid_needs_wal_flush = false;
+			independent_commit_lsn = InvalidXLogRecPtr;
 			minParentSubId = InvalidSubTransactionId;
 		}
 
@@ -2132,14 +2202,17 @@ undo_xact_callback(XactEvent event, void *arg)
 				{
 					/* Commit o - o : independent Oriole transaction */
 
-					elog(DEBUG4, "XACT_EVENT_COMMIT [independent Oriole transaction] oxid %lu logicalXid %u top heapXid %u current heapXid %u useHeap %d",
-						 oxid, logicalXidContext.xid, heapXid, GetCurrentTransactionIdIfAny(), logicalXidContext.useHeap);
+					flushPos = XLogRecPtrIsValid(independent_commit_lsn)
+						? independent_commit_lsn
+						: finalize_independent_commit_wal(oxid, get_current_logical_xid());
 
-					current_oxid_xlog_precommit();
+					elog(DEBUG4, "XACT_EVENT_COMMIT [independent Oriole transaction] oxid %lu logicalXid %u top heapXid %u current heapXid %u useHeap %d flushPos %X/%X",
+						 oxid, logicalXidContext.xid, heapXid, GetCurrentTransactionIdIfAny(), logicalXidContext.useHeap, LSN_FORMAT_ARGS(flushPos));
 
-					flushPos = wal_commit(oxid, get_current_logical_xid(),
-										  false);
-					set_oxid_xlog_ptr(oxid, flushPos);
+					if (XLogRecPtrIsInvalid(flushPos) ||
+						(XLogRecPtrIsValid(XactLastCommitEnd) &&
+						 XactLastCommitEnd > flushPos))
+						flushPos = XactLastCommitEnd;
 
 					/* Flush WAL if needed */
 					if (!XLogRecPtrIsInvalid(flushPos) &&
@@ -2188,6 +2261,7 @@ undo_xact_callback(XactEvent event, void *arg)
 				reset_cur_undo_locations();
 				reset_command_undo_locations();
 				oxid_needs_wal_flush = false;
+				independent_commit_lsn = InvalidXLogRecPtr;
 				minParentSubId = InvalidSubTransactionId;
 
 				/*
@@ -2221,6 +2295,7 @@ undo_xact_callback(XactEvent event, void *arg)
 				current_oxid_abort();
 				set_oxid_xlog_ptr(oxid, InvalidXLogRecPtr);
 				oxid_needs_wal_flush = false;
+				independent_commit_lsn = InvalidXLogRecPtr;
 
 				/*
 				 * TODO: Find a better place or add a hook at the end of
@@ -2566,6 +2641,7 @@ start_autonomous_transaction(OAutonomousTxState *state)
 	int			i;
 
 	state->needs_wal_flush = oxid_needs_wal_flush;
+	state->independent_commit_lsn = independent_commit_lsn;
 	state->oxid = get_current_oxid_if_any();
 	get_current_logical_xid_ctx(&state->logicalXidContext);
 	for (i = 0; i < (int) UndoLogsCount; i++)
@@ -2576,6 +2652,7 @@ start_autonomous_transaction(OAutonomousTxState *state)
 		flush_local_wal(false, false);
 
 	oxid_needs_wal_flush = false;
+	independent_commit_lsn = InvalidXLogRecPtr;
 	reset_current_oxid();
 	GET_CUR_PROCDATA()->autonomousNestingLevel++;
 }
@@ -2605,6 +2682,7 @@ abort_autonomous_transaction(OAutonomousTxState *state)
 	}
 
 	oxid_needs_wal_flush = state->needs_wal_flush;
+	independent_commit_lsn = state->independent_commit_lsn;
 	GET_CUR_PROCDATA()->autonomousNestingLevel--;
 	set_current_oxid(state->oxid);
 	set_current_logical_xid(&state->logicalXidContext);
@@ -2642,6 +2720,7 @@ finish_autonomous_transaction(OAutonomousTxState *state)
 	}
 
 	oxid_needs_wal_flush = state->needs_wal_flush;
+	independent_commit_lsn = state->independent_commit_lsn;
 	GET_CUR_PROCDATA()->autonomousNestingLevel--;
 	set_current_oxid(state->oxid);
 	set_current_logical_xid(&state->logicalXidContext);

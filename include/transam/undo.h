@@ -279,6 +279,7 @@ typedef struct
 	bool		needs_wal_flush;
 	bool		has_retained_undo_location[(int) UndoLogsCount];
 	bool		local_wal_has_material_changes;
+	XLogRecPtr	independent_commit_lsn;
 	OXid		oxid;
 	LogicalXidCtx logicalXidContext;
 } OAutonomousTxState;
@@ -369,6 +370,7 @@ extern void get_cur_undo_locations(UndoStackLocations *locations,
 extern void set_cur_undo_locations(UndoLogType undoType,
 								   UndoStackLocations locations);
 extern void reset_cur_undo_locations(void);
+extern bool orioledb_get_independent_commit_lsn(XLogRecPtr *local_commit);
 extern void undo_xact_callback(XactEvent event, void *arg);
 extern void undo_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 								  SubTransactionId parentSubid, void *arg);
